@@ -1,322 +1,222 @@
-"""Heuristic move-selection logic for the Battlesnake.
-
-This is a "scaredy-snake" policy that prioritizes staying far from enemies
-and only eats when very hungry to maintain minimal length.
-When well-fed, it gravitates toward the center of the board.
-
-Board coordinates: ``(0, 0)`` is the bottom-left corner.
-  up    -> y + 1
-  down  -> y - 1
-  left  -> x - 1
-  right -> x + 1
-
-Game-state schema reference: https://docs.battlesnake.com/api
-"""
-
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 import math
+from heapq import heappush, heappop
 
 Point = Tuple[int, int]
-
 DIRECTIONS: Dict[str, Point] = {
-    "up": (0, 1),
-    "down": (0, -1),
-    "left": (-1, 0),
-    "right": (1, 0),
+    "up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)
 }
 
-# How far we try to stay from enemy heads (in cells).
-SAFE_DISTANCE = 5  # Increased from 3
-# Only eat when health drops below this threshold.
-STARVING_THRESHOLD = 40  # Changed from 30
-# How much we value distance from enemies vs food.
-ENEMY_DISTANCE_WEIGHT = 15  # Increased from 10
-FOOD_DISTANCE_WEIGHT = 2
-# Penalty applied to a move that could lose a head-to-head collision.
-HEAD_TO_HEAD_PENALTY = 500_000  # Increased from 100_000
-# Bonus for open space (to avoid being cornered).
-SPACE_BONUS = 3  # Increased from 1
-# Weight for center-gravity when well-fed.
-CENTER_GRAVITY_WEIGHT = 5  # Increased from 3
-# Extra penalty for being near walls when well-fed.
-WALL_PENALTY = 50
-# Minimum safe distance to maintain from any enemy body.
-MIN_BODY_DISTANCE = 2
-# Penalty for being too close to enemy bodies.
-BODY_PROXIMITY_PENALTY = 200
-
+# === Параметры (обновлены) ===
+STARVING_THRESHOLD = 40
+CRITICAL_HUNGER = 22
+ENEMY_REPULSION = 18
+LONGER_ENEMY_REPULSION = 35      # Новый сильный коэффициент
+FOOD_WEIGHT = 5
+SPACE_BONUS = 2.3
+HEAD_TO_HEAD_PENALTY = 600_000   # Ещё сильнее
+WALL_PENALTY = 12
+LENGTH_ADVANTAGE = 45
 
 def get_info() -> Dict[str, str]:
-    """Appearance + metadata returned from ``GET /``."""
     return {
         "apiversion": "1",
-        "author": "scaredy-snake",
-        "color": "#4a90d9",
-        "head": "silly",
+        "author": "pro-cautious",
+        "color": "#1e8449",
+        "head": "safe",
         "tail": "bolt",
-        "version": "3.0.0",
+        "version": "3.2",
     }
 
-
 def choose_move(game_state: Dict) -> str:
-    """Return the next move using the scaredy-snake heuristic."""
-    return choose_move_scaredy(game_state)
-
-
-def choose_move_scaredy(game_state: Dict) -> str:
-    """Return the next move for the current turn.
-
-    Strategy:
-    1. Stay as far as possible from enemy heads AND bodies.
-    2. Avoid head-to-head collisions with equal/larger snakes.
-    3. Only go for food when health is below STARVING_THRESHOLD.
-    4. When well-fed, gravitate toward the center of the board.
-    5. Prefer moves that lead to more open space.
-    6. Account for moving tails (tails become free next turn).
-    7. Actively avoid walls and corners when possible.
-    """
     board = game_state["board"]
     you = game_state["you"]
-    width: int = board["width"]
-    height: int = board["height"]
-
+    w, h = board["width"], board["height"]
     head: Point = (you["head"]["x"], you["head"]["y"])
-    my_length: int = you["length"]
-    health: int = you["health"]
+    my_len = you["length"]
+    health = you["health"]
+    my_id = you["id"]
 
-    # Calculate occupied cells considering moving tails
-    occupied = _occupied_cells_accounting_tails(board["snakes"])
-    enemy_heads = _get_enemy_heads(board["snakes"], you["id"])
-    enemy_bodies = _get_enemy_bodies(board["snakes"], you["id"])
-    danger = _head_to_head_cells(board["snakes"], you["id"], my_length)
+    occupied = _occupied_cells(board["snakes"])
+    enemy_heads = _get_enemy_heads(board["snakes"], my_id)
     foods = [(f["x"], f["y"]) for f in board["food"]]
 
-    # Calculate center of the board
-    center = (width / 2.0, height / 2.0)
-
-    best_move = None
+    best_dir = "up"
     best_score = float("-inf")
 
-    for move, (dx, dy) in DIRECTIONS.items():
-        nxt = (head[0] + dx, head[1] + dy)
-
-        # Don't move out of bounds or into occupied cells.
-        if not _in_bounds(nxt, width, height):
-            continue
-        if nxt in occupied:
+    for dir_name, delta in DIRECTIONS.items():
+        nxt: Point = (head[0] + delta[0], head[1] + delta[1])
+        if not _in_bounds(nxt, w, h) or nxt in occupied:
             continue
 
-        score = 0.0
-
-        # CRITICAL: Heavy penalty for dangerous head-to-head positions.
-        if nxt in danger:
-            score -= HEAD_TO_HEAD_PENALTY
-            # If it's a guaranteed loss, just skip this move entirely
-            if _is_losing_head_to_head(nxt, board["snakes"], you["id"], my_length):
-                continue
-
-        # Primary goal: maximize distance to ALL enemies (heads AND bodies).
-        all_enemy_cells = enemy_heads + enemy_bodies
-        
-        if all_enemy_cells:
-            # Minimum distance to nearest enemy (head or body).
-            min_enemy_dist = min(_manhattan(nxt, ec) for ec in all_enemy_cells)
-            
-            # Heavy penalty for being too close to enemies.
-            if min_enemy_dist < MIN_BODY_DISTANCE:
-                score -= BODY_PROXIMITY_PENALTY * (MIN_BODY_DISTANCE - min_enemy_dist + 1)
-            
-            # Base score from distance to enemies.
-            score += min_enemy_dist * ENEMY_DISTANCE_WEIGHT
-            
-            # Extra bonus for being far from all enemies (use sum of inverse distances).
-            total_enemy_repulsion = sum(1.0 / max(1, _manhattan(nxt, ec)) for ec in all_enemy_cells)
-            score += total_enemy_repulsion * ENEMY_DISTANCE_WEIGHT * 2
-
-        # Secondary goal: only chase food when starving.
-        if foods and health < STARVING_THRESHOLD:
-            # Find the nearest food to this move position.
-            nearest_food_dist = min(_manhattan(nxt, f) for f in foods)
-            # Bonus inversely proportional to distance (closer = better).
-            # More aggressive food seeking when health is very low.
-            hunger_factor = (STARVING_THRESHOLD - health) / STARVING_THRESHOLD
-            score += (1.0 / max(1, nearest_food_dist)) * FOOD_DISTANCE_WEIGHT * hunger_factor * 10
-        elif foods and health >= STARVING_THRESHOLD:
-            # When not hungry, actively avoid food to keep length small.
-            nearest_food_dist = min(_manhattan(nxt, f) for f in foods)
-            # Stronger penalty for being near food when well-fed.
-            score -= (1.0 / max(1, nearest_food_dist)) * 5
-
-        # When well-fed, strongly gravitate toward the center of the board.
-        if health >= STARVING_THRESHOLD:
-            # Calculate distance to center (Euclidean for smooth gradient).
-            dist_to_center = math.sqrt((nxt[0] - center[0])**2 + (nxt[1] - center[1])**2)
-            # Bonus inversely proportional to distance from center.
-            center_bonus = (1.0 / max(0.1, dist_to_center)) * CENTER_GRAVITY_WEIGHT
-            score += center_bonus
-            
-            # Penalty for being near walls.
-            dist_to_wall = min(
-                nxt[0],  # distance to left wall
-                width - 1 - nxt[0],  # distance to right wall
-                nxt[1],  # distance to bottom wall
-                height - 1 - nxt[1]  # distance to top wall
-            )
-            if dist_to_wall <= 1:
-                score -= WALL_PENALTY * (2 - dist_to_wall)
-
-        # Check reachable space to avoid being cornered.
-        # More thorough flood fill with higher limit.
-        space = _flood_fill(nxt, occupied, width, height, limit=my_length * 4)
-        score += space * SPACE_BONUS
-
-        # Extra safety: avoid moves that lead to dead ends.
-        if space < my_length:
-            score -= 1000 * (my_length - space)
+        score = _evaluate_position(
+            nxt, head, my_len, health, occupied, enemy_heads, foods,
+            board["snakes"], my_id, w, h
+        )
 
         if score > best_score:
             best_score = score
-            best_move = move
+            best_dir = dir_name
 
-    # No safe move found -> move up and hope for the best.
-    return best_move or "up"
+    return best_dir
 
 
-def _is_losing_head_to_head(
-    nxt: Point, snakes: List[Dict], my_id: str, my_length: int
-) -> bool:
-    """Check if moving to nxt would result in a guaranteed loss in head-to-head."""
+def _evaluate_position(nxt, head, my_len, health, occupied, enemy_heads, foods, snakes, my_id, w, h):
+    score = 0.0
+
+    # === УСИЛЕННЫЙ FEAR ОТ ДЛИННЫХ ВРАГОВ ===
+    longer_near = False
+    for eh in enemy_heads:
+        dist = _manhattan(nxt, eh)
+        min_dist_to_any = min((_manhattan(nxt, e) for e in enemy_heads), default=999)
+        
+        # Общий repulsion
+        score += (min_dist_to_any ** 1.6) * ENEMY_REPULSION
+        
+        # Специальный страх от более длинных
+        enemy = next((s for s in snakes if (s["head"]["x"], s["head"]["y"]) == eh), None)
+        if enemy and enemy["length"] > my_len:
+            score += (1.0 / max(1, dist)) * LONGER_ENEMY_REPULSION * 4.5
+            if dist <= 4:
+                longer_near = True
+
+    # Head-to-head (особенно опасно против длинных)
+    if _is_dangerous_head_collision(nxt, snakes, my_len):
+        score -= HEAD_TO_HEAD_PENALTY
+        # Дополнительный штраф, если это длинный враг
+        if longer_near:
+            score -= HEAD_TO_HEAD_PENALTY * 0.6
+
+    # A* к еде
+    if foods:
+        score += _food_a_star_score(nxt, foods, occupied, snakes, my_id, w, h, health)
+
+    # Пространство
+    space = _advanced_flood_fill(nxt, occupied, snakes, my_id, w, h, my_len * 2)
+    score += space * SPACE_BONUS
+
+    # Стены
+    if _is_near_wall(nxt, w, h, margin=2):
+        score -= WALL_PENALTY
+
+    return score
+
+
+def _is_dangerous_head_collision(pos: Point, snakes: List[Dict], my_len: int) -> bool:
     for snake in snakes:
-        if snake["id"] == my_id:
+        e_len = snake["length"]
+        if e_len < my_len - 2:   # сильно короче — терпимо
             continue
-        if snake["length"] >= my_length:
-            ehead = (snake["head"]["x"], snake["head"]["y"])
-            # Check if enemy could also move to the same cell
-            for dx, dy in DIRECTIONS.values():
-                enemy_move = (ehead[0] + dx, ehead[1] + dy)
-                if enemy_move == nxt:
-                    return True
+        ehead = (snake["head"]["x"], snake["head"]["y"])
+        for d in DIRECTIONS.values():
+            if (ehead[0] + d[0], ehead[1] + d[1]) == pos:
+                return True
     return False
 
 
-def _occupied_cells_accounting_tails(snakes: List[Dict]) -> Set[Point]:
-    """Calculate occupied cells, considering that tails will move next turn.
-    
-    A snake's tail cell will become free on the next turn UNLESS the snake
-    has just eaten (indicated by the body segments). We check if the snake
-    is growing by comparing the last two body segments - if they're the same,
-    the snake just ate and the tail won't move.
-    """
-    occupied: Set[Point] = set()
-    
-    for snake in snakes:
-        body = snake["body"]
-        
-        # Check if snake just ate (tail won't move)
-        # If last two segments are identical, snake is growing
-        tail_will_move = True
-        if len(body) >= 2:
-            last = (body[-1]["x"], body[-1]["y"])
-            second_last = (body[-2]["x"], body[-2]["y"])
-            if last == second_last:
-                tail_will_move = False
-        
-        # Add all body segments
-        for i, seg in enumerate(body):
-            # Skip the tail if it will move (become free next turn)
-            if i == len(body) - 1 and tail_will_move:
+# === Остальные функции остаются прежними (A*, flood fill и т.д.) ===
+def _food_a_star_score(nxt, foods, occupied, snakes, my_id, w, h, health):
+    if health > STARVING_THRESHOLD + 20:
+        return -sum(1.0 / max(1, _manhattan(nxt, f)) for f in foods) * 4
+
+    best = -999
+    for food in foods:
+        path = _a_star(nxt, food, occupied, snakes, my_id, w, h)
+        if path and len(path) > 0:
+            dist = len(path)
+            value = max(0, 45 - dist) * max(1, STARVING_THRESHOLD - health + 20) / max(1, dist)
+            best = max(best, value)
+    return best * FOOD_WEIGHT
+
+
+def _a_star(start: Point, goal: Point, occupied: Set[Point], snakes, my_id, w, h) -> Optional[List[Point]]:
+    open_set = []
+    heappush(open_set, (0, start))
+    came_from = {}
+    g_score = {start: 0}
+    f_score = {start: _manhattan(start, goal)}
+
+    while open_set:
+        _, current = heappop(open_set)
+        if current == goal:
+            return _reconstruct_path(came_from, current)
+
+        for d in DIRECTIONS.values():
+            neighbor = (current[0] + d[0], current[1] + d[1])
+            if not _in_bounds(neighbor, w, h):
                 continue
-            occupied.add((seg["x"], seg["y"]))
-    
-    return occupied
-
-
-def _get_enemy_heads(snakes: List[Dict], my_id: str) -> List[Point]:
-    """Get positions of all enemy snake heads."""
-    heads = []
-    for snake in snakes:
-        if snake["id"] != my_id:
-            heads.append((snake["head"]["x"], snake["head"]["y"]))
-    return heads
-
-
-def _get_enemy_bodies(snakes: List[Dict], my_id: str) -> List[Point]:
-    """Get all body segments of enemy snakes (excluding heads and tails that will move)."""
-    bodies = []
-    for snake in snakes:
-        if snake["id"] == my_id:
-            continue
-        
-        body = snake["body"]
-        
-        # Determine if tail will move
-        tail_will_move = True
-        if len(body) >= 2:
-            last = (body[-1]["x"], body[-1]["y"])
-            second_last = (body[-2]["x"], body[-2]["y"])
-            if last == second_last:
-                tail_will_move = False
-        
-        # Add all body segments except head and possibly tail
-        for i, seg in enumerate(body):
-            # Skip head (already tracked separately)
-            if i == 0:
+            if neighbor in occupied and not _will_tail_free(neighbor, snakes, my_id):
                 continue
-            # Skip tail if it will move
-            if i == len(body) - 1 and tail_will_move:
-                continue
-            bodies.append((seg["x"], seg["y"]))
-    
-    return bodies
+
+            tentative_g = g_score.get(current, 0) + 1
+            if tentative_g < g_score.get(neighbor, float("inf")):
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = tentative_g + _manhattan(neighbor, goal)
+                heappush(open_set, (f_score[neighbor], neighbor))
+    return None
 
 
-def _head_to_head_cells(snakes: List[Dict], my_id: str, my_length: int) -> Set[Point]:
-    """Cells adjacent to enemy heads that could result in losing head-to-head.
-
-    A cell is dangerous if an enemy of equal or greater length could move there
-    next turn. We heavily penalize these positions because our scaredy-snake
-    wants to avoid any confrontation.
-    """
-    danger: Set[Point] = set()
-    for snake in snakes:
-        if snake["id"] == my_id:
-            continue
-        if snake["length"] < my_length:
-            continue  # We can win against shorter snakes
-        ehead = (snake["head"]["x"], snake["head"]["y"])
-        for dx, dy in DIRECTIONS.values():
-            danger.add((ehead[0] + dx, ehead[1] + dy))
-    return danger
+def _reconstruct_path(came_from, current):
+    path = [current]
+    while current in came_from:
+        current = came_from[current]
+        path.append(current)
+    return path[::-1]
 
 
-def _flood_fill(
-    start: Point, occupied: Set[Point], width: int, height: int, limit: int
-) -> int:
-    """Count open cells reachable from ``start`` (capped at ``limit``)."""
-    seen: Set[Point] = {start}
-    stack: List[Point] = [start]
+def _advanced_flood_fill(start, occupied, snakes, my_id, w, h, limit):
+    seen = {start}
+    stack = [start]
     count = 0
-    while stack:
-        x, y = stack.pop()
+    freed = 0
+    while stack and count < limit:
+        pos = stack.pop()
         count += 1
-        if count >= limit:
-            break
-        for dx, dy in DIRECTIONS.values():
-            nbr = (x + dx, y + dy)
-            if nbr in seen:
-                continue
-            if not _in_bounds(nbr, width, height):
+        for d in DIRECTIONS.values():
+            nbr = (pos[0] + d[0], pos[1] + d[1])
+            if nbr in seen or not _in_bounds(nbr, w, h):
                 continue
             if nbr in occupied:
+                if _will_tail_free(nbr, snakes, my_id):
+                    freed += 1
+                    seen.add(nbr)
+                    stack.append(nbr)
                 continue
             seen.add(nbr)
             stack.append(nbr)
-    return count
+    return count + freed * 7
 
 
-def _in_bounds(p: Point, width: int, height: int) -> bool:
-    return 0 <= p[0] < width and 0 <= p[1] < height
+def _will_tail_free(pos, snakes, my_id):
+    for snake in snakes:
+        body = snake.get("body", [])
+        if len(body) < 3: continue
+        tail = (body[-1]["x"], body[-1]["y"])
+        if pos == tail:
+            return True
+    return False
+
+
+def _occupied_cells(snakes):
+    occ = set()
+    for s in snakes:
+        for b in s.get("body", []):
+            occ.add((b["x"], b["y"]))
+    return occ
+
+
+def _get_enemy_heads(snakes, my_id):
+    return [(s["head"]["x"], s["head"]["y"]) for s in snakes if s["id"] != my_id]
+
+
+def _in_bounds(p: Point, w: int, h: int) -> bool:
+    return 0 <= p[0] < w and 0 <= p[1] < h
 
 
 def _manhattan(a: Point, b: Point) -> int:
     return abs(a[0] - b[0]) + abs(a[1] - b[1])
+
+
+def _is_near_wall(p: Point, w: int, h: int, margin: int = 2) -> bool:
+    return p[0] < margin or p[0] >= w - margin or p[1] < margin or p[1] >= h - margin
