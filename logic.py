@@ -7,25 +7,25 @@ DIRECTIONS: Dict[str, Point] = {
     "up": (0, 1), "down": (0, -1), "left": (-1, 0), "right": (1, 0)
 }
 
-# === Параметры (обновлены) ===
-STARVING_THRESHOLD = 40
-CRITICAL_HUNGER = 22
-ENEMY_REPULSION = 18
-LONGER_ENEMY_REPULSION = 35      # Новый сильный коэффициент
-FOOD_WEIGHT = 5
-SPACE_BONUS = 2.3
-HEAD_TO_HEAD_PENALTY = 600_000   # Ещё сильнее
-WALL_PENALTY = 12
-LENGTH_ADVANTAGE = 45
+# Баланс голода возвращён к умеренному
+STARVING_THRESHOLD = 45
+CRITICAL_HUNGER = 25
+FOOD_WEIGHT = 7.5
+ENEMY_REPULSION = 16
+LONGER_ENEMY_REPULSION = 38
+SPACE_BONUS = 2.4
+HEAD_TO_HEAD_PENALTY = 550_000
+LENGTH_ADVANTAGE_BONUS = 55      # Сильный бонус за убийство коротких
+CENTER_BONUS = 12
 
 def get_info() -> Dict[str, str]:
     return {
         "apiversion": "1",
-        "author": "pro-cautious",
-        "color": "#1e8449",
+        "author": "balanced-eater",
+        "color": "#228b22",
         "head": "safe",
         "tail": "bolt",
-        "version": "3.2",
+        "version": "4.0",
     }
 
 def choose_move(game_state: Dict) -> str:
@@ -64,30 +64,31 @@ def choose_move(game_state: Dict) -> str:
 def _evaluate_position(nxt, head, my_len, health, occupied, enemy_heads, foods, snakes, my_id, w, h):
     score = 0.0
 
-    # === УСИЛЕННЫЙ FEAR ОТ ДЛИННЫХ ВРАГОВ ===
-    longer_near = False
-    for eh in enemy_heads:
-        dist = _manhattan(nxt, eh)
-        min_dist_to_any = min((_manhattan(nxt, e) for e in enemy_heads), default=999)
-        
-        # Общий repulsion
-        score += (min_dist_to_any ** 1.6) * ENEMY_REPULSION
-        
-        # Специальный страх от более длинных
-        enemy = next((s for s in snakes if (s["head"]["x"], s["head"]["y"]) == eh), None)
-        if enemy and enemy["length"] > my_len:
-            score += (1.0 / max(1, dist)) * LONGER_ENEMY_REPULSION * 4.5
-            if dist <= 4:
-                longer_near = True
+    # Центр доски — хороший бонус
+    center_x, center_y = w // 2, h // 2
+    score += (w + h - _manhattan(nxt, (center_x, center_y))) * CENTER_BONUS * 0.3
 
-    # Head-to-head (особенно опасно против длинных)
+    # Repulsion от врагов
+    if enemy_heads:
+        min_dist = min(_manhattan(nxt, eh) for eh in enemy_heads)
+        score += min_dist ** 1.5 * ENEMY_REPULSION
+
+        # Особый страх перед длинными
+        for eh in enemy_heads:
+            enemy = next((s for s in snakes if (s["head"]["x"], s["head"]["y"]) == eh), None)
+            if enemy and enemy["length"] > my_len + 1:
+                dist = _manhattan(nxt, eh)
+                score += (1.0 / max(1, dist)) * LONGER_ENEMY_REPULSION * 4
+
+    # Head-to-head логика
     if _is_dangerous_head_collision(nxt, snakes, my_len):
-        score -= HEAD_TO_HEAD_PENALTY
-        # Дополнительный штраф, если это длинный враг
-        if longer_near:
-            score -= HEAD_TO_HEAD_PENALTY * 0.6
+        # Против более коротких — можно атаковать
+        if _can_safely_attack(nxt, snakes, my_len):
+            score += LENGTH_ADVANTAGE_BONUS
+        else:
+            score -= HEAD_TO_HEAD_PENALTY
 
-    # A* к еде
+    # Еда (много ест, но не слишком жадно)
     if foods:
         score += _food_a_star_score(nxt, foods, occupied, snakes, my_id, w, h, health)
 
@@ -95,17 +96,13 @@ def _evaluate_position(nxt, head, my_len, health, occupied, enemy_heads, foods, 
     space = _advanced_flood_fill(nxt, occupied, snakes, my_id, w, h, my_len * 2)
     score += space * SPACE_BONUS
 
-    # Стены
-    if _is_near_wall(nxt, w, h, margin=2):
-        score -= WALL_PENALTY
-
     return score
 
 
-def _is_dangerous_head_collision(pos: Point, snakes: List[Dict], my_len: int) -> bool:
+def _can_safely_attack(pos: Point, snakes: List[Dict], my_len: int) -> bool:
+    """Можно ли безопасно ударить головой короткую змею"""
     for snake in snakes:
-        e_len = snake["length"]
-        if e_len < my_len - 2:   # сильно короче — терпимо
+        if snake["length"] >= my_len:
             continue
         ehead = (snake["head"]["x"], snake["head"]["y"])
         for d in DIRECTIONS.values():
@@ -114,21 +111,30 @@ def _is_dangerous_head_collision(pos: Point, snakes: List[Dict], my_len: int) ->
     return False
 
 
-# === Остальные функции остаются прежними (A*, flood fill и т.д.) ===
-def _food_a_star_score(nxt, foods, occupied, snakes, my_id, w, h, health):
-    if health > STARVING_THRESHOLD + 20:
-        return -sum(1.0 / max(1, _manhattan(nxt, f)) for f in foods) * 4
+def _is_dangerous_head_collision(pos: Point, snakes: List[Dict], my_len: int) -> bool:
+    for snake in snakes:
+        if snake["length"] < my_len - 1:   # Короткие — не страшно
+            continue
+        ehead = (snake["head"]["x"], snake["head"]["y"])
+        for d in DIRECTIONS.values():
+            if (ehead[0] + d[0], ehead[1] + d[1]) == pos:
+                return True
+    return False
 
+
+def _food_a_star_score(nxt, foods, occupied, snakes, my_id, w, h, health):
     best = -999
     for food in foods:
         path = _a_star(nxt, food, occupied, snakes, my_id, w, h)
         if path and len(path) > 0:
             dist = len(path)
-            value = max(0, 45 - dist) * max(1, STARVING_THRESHOLD - health + 20) / max(1, dist)
+            hunger_mult = 2.0 if health < STARVING_THRESHOLD else 1.0
+            value = (50 - dist) * hunger_mult / max(1, dist)
             best = max(best, value)
     return best * FOOD_WEIGHT
 
 
+# ====================== Вспомогательные функции ======================
 def _a_star(start: Point, goal: Point, occupied: Set[Point], snakes, my_id, w, h) -> Optional[List[Point]]:
     open_set = []
     heappush(open_set, (0, start))
